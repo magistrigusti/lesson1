@@ -2,15 +2,19 @@ package scanner
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/liteclient"
+	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
+	"gopkg.in/tomb.v1"
+	"gorm.io/gorm"
 
 	"ton-lessons2/internal/app"
 	"ton-lessons2/internal/storage"
-
 )
 
 type scanner struct {
@@ -19,6 +23,9 @@ type scanner struct {
 	shardLastSeqno map[string]uint32
 }
 
+// * - pointer
+// & - link
+// &
 func NewScanner() (*scanner, error) {
 	client := liteclient.NewConnectionPool()
 
@@ -39,14 +46,20 @@ func NewScanner() (*scanner, error) {
 }
 
 func (s *scanner) Listen() {
-	logrus.Info("[SCN] start scaning blocks")
+	logrus.Info("[SCN] start scanning blocks")
+
+	if err := app.DB.Last(&s.lastBlock).Error; err != nil {
+		s.lastBlock.SeqNo = 0
+	} else {
+		s.lastBlock.SeqNo = 0
+	}
 
 	if s.lastBlock.SeqNo == 0 {
 		lastMaster, err := s.api.GetMasterchainInfo(context.Background())
 		for err != nil {
 			time.Sleep(time.Second)
 			logrus.Error("[SCN] error when get last master: ", err)
-			lastMaster, err = s.api.CurrentMasterchainInfo(context.Background())
+			lastMaster, err = s.api.GetMasterchainInfo(context.Background())
 		}
 
 		s.lastBlock.SeqNo = lastMaster.SeqNo
@@ -77,7 +90,7 @@ func (s *scanner) Listen() {
 	)
 	for err != nil {
 		time.Sleep(time.Second)
-		logrus.Error("[SCN] error when get first shard: ", err)
+		logrus.Error("[SCN] error when get first shards: ", err)
 		firstShards, err = s.api.GetBlockShardsInfo(
 			context.Background(),
 			masterBlock,
@@ -119,6 +132,32 @@ func (s *scanner) processBlocks() {
 	}
 }
 
+// jetton transfer
+// a wallet -> a jetton wallet -> b jetton wallet -> b wallet(notification)
+//								  				-> a wallet(excesses)
+
+// struct block
+// 32bit - seqno
+// 32bit - workchain
+// 64bit - shard
+// 32bit - time
+
+// func a() -> create struct block
+// func b(block struct.block) struct.block -> change struct block
+// newBlock = b(newBlock)
+// allocate memory for new struct
+// -> copy struct
+// change struct
+// return struct.block (copy)
+// func c(block *struct.block) -> change struct block
+// c(&newBlock)
+// uint32 -> 0xa83127
+// block.seqno = 123
+// nil - default pointer value
+
+// input message 1
+// output messages 2
+
 func (s *scanner) processMcBlock(master *ton.BlockIDExt) error {
 	timeStart := time.Now()
 
@@ -149,26 +188,34 @@ func (s *scanner) processMcBlock(master *ton.BlockIDExt) error {
 
 	if len(newShards) == 0 {
 		newShards = currentShards
+	} else {
+		newShards = append(newShards, currentShards...)
 	}
-	newShards = append(newShards, currentShards...)
 
-	vartxList []*tlb.Transaction 
+	if len(newShards) == 0 {
+		return nil
+	}
 
-	for _, shard := range newShards {
+	var txList []*tlb.Transaction
+
+	uniqueShards := s.getUniqueShards(newShards)
+	var wg sync.WaitGroup
+	var tombGetTransactions tomb.Tomb
+	allDone := make(chan struct{})
+	for _, shard := range uniqueShards {
 		var (
-			fetchIDs []ton.TransactionShortInfo
-			after *ton.TransactionID3
-			more = true
+			fetchedIDs []ton.TransactionShortInfo
+			after      *ton.TransactionID3
+			more       = true
 		)
 
 		for more {
-			fetchedIDs, more, err = s.apiGetBlockTransactionsV2(
+			fetchedIDs, more, err = s.api.GetBlockTransactionsV2(
 				context.Background(),
 				shard,
 				100,
 				after,
 			)
-
 			if err != nil {
 				return err
 			}
@@ -177,43 +224,106 @@ func (s *scanner) processMcBlock(master *ton.BlockIDExt) error {
 				after = fetchedIDs[len(fetchedIDs)-1].ID3()
 			}
 
-			for _, id := range fetchIDs {
-				tx, err := s.api.GetTransaction(
-					context.Background(),
-					shard,
-					address.NewAddress(0, 0, id.Account),
-					id.LT,
-				)
-				if err != nil {
-					return err 
-				}
-				txList = append(txList, tx)
+			for _, id := range fetchedIDs {
+				wg.Add(1)
+				go func(shard *tlb.BlockInfo, account []byte, lt uint64) {
+					defer wg.Done()
+					tx, err := s.api.GetTransaction(
+						context.Background(),
+						shard,
+						address.NewAddress(0, 0, account),
+						lt,
+					)
+					for i := 0; i < 3 || err != nil; i++ {
+						time.Sleep(time.Second)
+						tx, err = s.api.GetTransaction(
+							context.Background(),
+							shard,
+							address.NewAddress(0, 0, account),
+							lt,
+						)
+					}
+					if err != nil {
+						tombGetTransactions.Kill(err)
+					}
+					txList = append(txList, tx)
+				}(shard, id.Account, id.LT)
+
 			}
 		}
+
 	}
+
+	go func() {
+		wg.Wait()
+		close(allDone)
+	}()
+
+	select {
+	case <-allDone:
+	case <-tombGetTransactions.Dying():
+		logrus.Error("[SCN] err when get transactions: ", tombGetTransactions.Err())
+		return tombGetTransactions.Err()
+	}
+	tombGetTransactions.Done()
 
 	// process transactions
 
-	if err := s.addBlock(*master); err != nil {
+	dbtx := app.DB.Begin()
+
+	var wgTrans sync.WaitGroup
+	allDoneTrans := make(chan struct{})
+	var tombTrans tomb.Tomb
+
+	for _, transaction := range txList {
+		wg.Add(1)
+
+		go func(dbtx *gorm.DB, transaction *tlb.Transaction) {
+			defer wg.Done()
+			if err := s.processTransaction(transaction, dbtx); err != nil {
+				tombTrans.Kill(err)
+			}
+		}(dbtx, transaction)
+	}
+
+	go func() {
+		wgTrans.Wait()
+		close(allDoneTrans)
+	}()
+
+	select {
+	case <-allDoneTrans:
+	case <-tombTrans.Dying():
+		logrus.Error("[SCN] err when process transactions: ", err)
+		dbtx.Rollback()
+		return tombTrans.Err()
+	}
+	tombTrans.Done()
+
+	if err := s.addBlock(*master, dbtx); err != nil {
+		dbtx.Rollback()
+		return err
+	}
+
+	if err := dbtx.Commit().Error; err != nil {
+		logrus.Error("[SCN] dbtx commit err: ", err)
 		return err
 	}
 
 	lastSeqno, err := s.getLastBlockSeqno()
 	if err != nil {
 		logrus.Infof("[SCN] success process block [%d] time to process block [%0.2fs] trans count [%d]",
-		master.SeqNo,
-		time.Slice(timeStart).Seconds(),
-		len(txList),
+			master.SeqNo,
+			time.Since(timeStart).Seconds(),
+			len(txList),
 		)
 	} else {
-		logrus.Infof("[SCN] successs process block [%d|%d] time to process block [%0.2fs] trans count [%d]",
-		master.SeqNo,
-		lastSeqno,
-		time.Since(timeStart).Seconds(),
-		len(txList),
+		logrus.Infof("[SCN] success process block [%d|%d] time to process block [%0.2fs] trans count [%d]",
+			master.SeqNo,
+			lastSeqno,
+			time.Since(timeStart).Seconds(),
+			len(txList),
 		)
 	}
-
 	return nil
-
 }
